@@ -6,8 +6,8 @@ Packages: `requirements.txt`
 
 #### API Key
 -  OCR
-
-    **AWS API key**: Insert it here `/Users/[user]/.aws/credentials`, `.env`, or CLI
+  
+    **AWS API key**: Insert it here `/Users/[user]/.aws/credentials`, `.env`, or CLI \
     **Mistral API key**: Insert it here `.env` as `export MISTRAL_API_KEY=<api_key>`
 
 - LLM
