@@ -1,0 +1,50 @@
+{
+    "a": {
+        "desc": "Employee's Social Security Number (SSN)",
+        "type": "string",
+        "example": "123456789",
+        "required": true
+    },
+    "e": {
+        "desc": "Employee's Full Name",
+        "type": "string",
+        "example": "John Smith",
+        "required": true
+    },
+    "f": {
+        "desc": "Employee's address and ZIP code",
+        "type": "string",
+        "example": "3409 OLIVER ST UNIT A BAKERSFIELD CA 93307",
+        "required": true
+    },
+    "1": {
+        "desc": "1 Wages tips other comp",
+        "type": "float",
+        "example": 1234.56,
+        "required": true
+    },
+    "5": {
+        "desc": "5 Medicare wages and tips",
+        "type": "float",
+        "example": 1234.56,
+        "required": true
+    },
+    "12a": {
+        "desc": "12a code ",
+        "type": "string",
+        "example": "A 321.80",
+        "required": false
+    },
+    "12b": {
+        "desc": "12b code",
+        "type": "string",
+        "example": "CC 261.80",
+        "required": false
+    },
+    "14": {
+        "desc": "14 Other",
+        "type": "string",
+        "example": "UCRP 1,374.26 DCP-REG 916.18",
+        "required": false
+    }
+}
