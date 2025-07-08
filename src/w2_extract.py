@@ -190,7 +190,7 @@ def load_fields(file) -> dict[str, dict]:
             os.unlink(tmp_path)
 
 
-def extract_file(filepath: str, fields: dict[str, dict]=w2_fields, max_attempts: int=3, batch_id: str=None, filename: str=None, model_type: str="gpt-4o-mini", ocr_method: str="textract-kv", spatial: bool=False, extractor: OptimizedExtraction=None) -> list[dict[str, str]]:
+def extract_file(filepath: str, fields: dict[str, dict]=w2_fields, max_attempts: int=3, batch_id: str=None, filename: str=None, model_type: str="gpt-4o-mini", ocr_method: str="textract-kv", spatial: bool=False, extractor: OptimizedExtraction=None, save_batch: bool=True) -> list[dict[str, str]]:
     '''
     Extracts W2 fields from a PDF file using Textract.
     
@@ -223,14 +223,20 @@ def extract_file(filepath: str, fields: dict[str, dict]=w2_fields, max_attempts:
             ocr = ocr_load.OCR(filepath, ocr_method_obj)
             ocr_results = ocr.get_text_blocks()
             pages = ocr_results
+            print("========mistral OCR results==========")
+            print(json.dumps(pages[0], indent=4))
         elif ocr_method == "textractocr":
             ocr_method_obj = ocr_load.TextractOCR()
             ocr = ocr_load.OCR(filepath, ocr_method_obj)
             ocr_results = ocr.get_text_blocks()
             pages = ocr_results
+            print("========textractocr OCR results==========")
+            print(json.dumps(pages[0]['value'], indent=4))
         elif ocr_method == "textract-kv":
             kv_extractor = KVExtractDocument(filepath)
             pages = kv_extractor.pages
+            print("========textract-kv Image-to-text results==========")
+            print(pages[0].kvs)
         else:
             raise ValueError(f"Unsupported OCR method: {ocr_method}")
         
@@ -265,7 +271,8 @@ def extract_file(filepath: str, fields: dict[str, dict]=w2_fields, max_attempts:
             
             processed_files[filename] = processed_pages
             file_results[filename] = results
-            save_batch_results(batch_id, processed_files, file_results, ocr_cache)
+            if save_batch:
+                save_batch_results(batch_id, processed_files, file_results, ocr_cache)
                 
             print(f"Processed page {page_num + 1} of {filename}")
             
@@ -303,7 +310,7 @@ def process_single_file_parallel(args):
         print(f"Error processing {filename} after {processing_time:.2f} seconds: {str(e)}")
         return filename, None, e
 
-def extract_dir(dirpath: str, fields=w2_fields, file_out=None, batch_id: str=None, model_type: str="gpt-4o-mini", ocr_method: str="textract-kv", spatial: bool=False, prompt_opt: bool=False, label_file: str=None, test_file: str=None, test_label: str=None, max_workers: int=4) -> pd.DataFrame:
+def extract_dir(dirpath: str, fields=w2_fields, file_out=None, batch_id: str=None, model_type: str="gpt-4.1", ocr_method: str="textract-kv", spatial: bool=False, prompt_opt: bool=False, label_file: str=None, test_file: str=None, test_label: str=None, max_workers: int=4) -> pd.DataFrame:
     '''
     Extracts W2 fields from all PDF/JPG/PNG files in a directory.
     
@@ -587,6 +594,7 @@ if __name__ == "__main__":
     parser.add_argument("--label_file", type=str, help="Path to the label file for evaluation when prompt_opt is True")
     parser.add_argument("--test_file", type=str, help="Path to the test file path for evaluation when prompt_opt is True")
     parser.add_argument("--test_label", type=str, help="Path to the test label file for evaluation when prompt_opt is True")
+    parser.add_argument("--save_batch", action="store_true", help="Save batch results")
     args = parser.parse_args()
 
     try:
@@ -613,7 +621,7 @@ if __name__ == "__main__":
         if args.type == 'file':
             # If a single PDF file is provided, extract from that file
             filename = os.path.basename(args.filepath)
-            result_df = extract_file(args.filepath, custom_fields, args.max_attempts, batch_id=0, filename=filename, model_type=args.model_type_or_path, ocr_method=args.ocr_method, spatial=args.spatial_ocr)
+            result_df = extract_file(args.filepath, custom_fields, args.max_attempts, batch_id=0, filename=filename, model_type=args.model_type_or_path, ocr_method=args.ocr_method, spatial=args.spatial_ocr, save_batch=args.save_batch)
         elif args.type == 'dir':
             # If a directory is provided, extract from all PDF files in that directory
             result_df = extract_dir(args.filepath, custom_fields, args.file_out, model_type=args.model_type_or_path, ocr_method=args.ocr_method, spatial=args.spatial_ocr, prompt_opt=args.prompt_opt, label_file=args.label_file, test_file=args.test_file, test_label=args.test_label)
