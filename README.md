@@ -20,7 +20,8 @@ Launching Streamlit: `streamlit run src/w2_app.py`
 
 Import zipped directory of the PDFs
 
-### Python
+## Document Extraction with OCR Process
+#### For working with OCR pipeline and optimizing prompts:
 ```bash
 python src/w2_extract.py --fieldpath <fieldpath> --filepath <filepath> [options]
 ```
@@ -38,8 +39,30 @@ python src/w2_extract.py --fieldpath <fieldpath> --filepath <filepath> [options]
 - `--spatial_ocr`: Enable spatial OCR with coordinate information
 - `--prompt_opt`: Enable prompt optimization with evaluation
 - `--label_file FILE`: Path to label file for evaluation (required when using --prompt_opt)
+- `--train_file FILE`: Path to the training file path for prompt optimization (required when using --prompt_opt)
+- `--train_label FILE`: Path to the training label file for prompt optimization (required when using --prompt_opt)
 
 Should be able to handle PDF, directories, and zipped directory paths
+
+## OCR-based Extraction and Prompt Optimization
+#### For working with pre-extracted OCR data and optimizing prompts:
+```bash
+python src/extract_ocr.py --fieldpath <fieldpath> --test_file <test_file> [options]
+```
+
+##### Required Arguments:
+- `--fieldpath`: Path to the field definitions file (.json, .yaml, or .yml)
+- `--test_file`: Path to the test OCR data file (.json)
+
+##### Optional Arguments:
+- `--test_label`: Path to the test labels file (.csv) for evaluation
+- `--training_file`: Path to the training OCR data file (.json) for prompt optimization
+- `--training_label`: Path to the training label file (.csv) for prompt optimization
+- `--file_out`: Path to save the output CSV or Excel file
+- `--model_type {gpt-4o-mini,gpt-4.1,gpt-o3}`: Model type for extraction (default: gpt-4o-mini)
+- `--prompt_opt`: Enable prompt optimization (requires training_file and training_label)
+- `--opt_iterations`: Number of optimization iterations (default: 3)
+- `--max_workers`: Number of worker threads for parallel processing (default: 4)
 
 ## Evaluation
 

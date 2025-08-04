@@ -1,23 +1,15 @@
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
+from transformers import AutoTokenizer
 import tiktoken
+
+from field_validate import validate
 load_dotenv()
 
 import json
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, create_model
-from typing import Optional, TypedDict, Union, Dict, List, Type
+from typing import Optional, Dict, List, Type
 
-class FieldErrorAnalysis(TypedDict):
-    expected: Union[str, float]
-    actual: Union[str, float]
-    reason: str
-    filename: str
-
-class ErrorAnalysis(TypedDict):
-    """Model for structured error analysis output"""
-    response: Dict[str, List[FieldErrorAnalysis]] 
+from model import get_model
 
 class TypeMapping:
     STRING_TO_TYPE: Dict[str, Type] = {
@@ -32,103 +24,151 @@ class TypeMapping:
         """Convert a string representation to its corresponding Python type."""
         return cls.STRING_TO_TYPE.get(type_string)
     
-class OptimizedExtraction:
+class FVExtraction:
     def __init__(self, fields: dict[str, dict], model_type: str="gpt-4o-mini", max_attempts: int = 3):
+        self.llm = get_model(model_type)
         self.fields = fields
         self.model_type = model_type
         self.max_attempts = max_attempts
         self.base_template_parts = self._initialize_base_template()
-        
-        self.iteration_mismatches = [] 
-        self.iteration_error_analyses = []
-        self.current_iteration = 0
 
-        self.document_error_counts = defaultdict(int)
-        self.field_error_counts = defaultdict(int) 
+        self.meta_prompt = None
+        self.positive_exemplars = []
+        
 
     def _initialize_base_template(self) -> Dict[str, str]:
         """Initialize the base prompt template parts."""
         return {
+            'meta_prompt_instructions': """
+            [Meta-prompt Instructions]:
+            {meta_instructions}
+            ====End of Meta-prompt Instructions====
+            """,
             'base': """
-Extract value from a key:value list dictionary, OCR result, and/or coordinate layout given a description and type for each field in a `fields` dictionary.
+            Extract value from a key:value dictionary list, OCR result, and/or coordinate layout given a description and type for each field in a fields dictionary.
 
-Field names may not exactly match keys in the input data. Match values using semantic similarity, type expectations, and (when available) spatial relationships or OCR confidence.
+            **CRITICAL RULE: All extracted values MUST come exclusively from the INPUT DATA section. Do not use any information from examples, previous extractions, or external knowledge.**
 
-Return key-value results in a JSON dictionary string, where:
-- If a field is **not found**, return `null`.
-- If a field is found but has **no value**, return an **empty string**.
-- Values must respect their declared types (e.g., float, string).
-- Output must be compatible with `json.loads()` (i.e., double-quoted strings).
+            Return key-value results in a JSON dictionary string, where:
+            - If a field is **not found**, return `null`.
+            - If a field is found but has **no value**, return an **empty string**.
+            - Values must respect their declared types (e.g., float, string).
+            - Output must be compatible with `json.loads()` (i.e., double-quoted strings).
+            - Provide the final answer with rationale.
 
-{mode_instructions}
-""",
+            {mode_instructions}
+            """,
             'kvs': """
-Use only the key-value dictionary provided. Match field descriptions to dictionary keys using:
-- Semantic similarity
-- Field type expectations (e.g., float, string)
-Normalize keys for comparison (e.g., lowercase, remove punctuation).
-""",
+            Matching Strategy:
+              1. Normalize for comparison: Convert keys to lowercase, remove extra spaces/punctuation
+              2. Priority matching order:
+                - Exact field identifier match (e.g., field 'a' matches key starting with 'a ')
+                - Semantic similarity (e.g., "SSN" matches "social security number")
+                - Keyword overlap (e.g., "wages" in field matches "wages" in key)
+                - Type-based inference (e.g., 9-digit number for SSN field)
+            Value Selection:
+              - If value is a list, typically use the first clean entry
+              - Trim whitespace from extracted values (preserve essential formatting)
+              - Validate against expected type and format
+            """,
             'ocr': """
-Use the raw OCR text to identify values by:
-- Finding lines that contain field-like descriptions
-- Inferring label-value pairs by proximity in the OCR line order
-- Matching expected data format or type (e.g., 9-digit number for SSN)
-""",
+            Extraction Strategy:
+              1. Pattern Recognition: Look for "field_description: value" or "field_code value" patterns
+              2. Proximity Analysis: Find values on the same line or immediately following field descriptions
+              3. Multi-line Handling: For addresses/complex fields, capture continuation lines
+              4. Format Validation: Use expected patterns (9 digits for SSN, decimal for wages, etc.)
+            
+            Value Extraction:
+              - Extract values that appear after field identifiers
+              - Handle multi-line values (especially addresses)
+              - Clean extracted values but preserve essential formatting
+            """,
             'spatial': """
-Use OCR text and corresponding coordinates (x, y, confidence) to:
-- Identify field-value pairs using spatial alignment (e.g., same row or column)
-- Prefer high-confidence OCR results
-- Choose the value closest in position and most similar in meaning to the field description
-""",
-            'error_header': "\n==Previous Extraction Errors - CRITICAL: Learn from these patterns==\n",
-            'field_error': "\nField '{field}' ({desc}):\nPredicted (Extracted) Value:{pred}\nWhat went wrong:{reason}\nExpected (True) Value:{true}\n\n",
-            'error_analysis_section': "",
-            'example': """
-==Example==
-Example Fields dict:
-{{
-    'a': {{'desc': 'a: Employee's Social Security Number (SSN) [9 digits]', 'type': 'string', 'example': '123456789', 'required': True}},
-    '1': {{'desc': '1 Wages tips other comp', 'type': 'float', 'example': 1234.56, 'required': True}},
-    'e': {{'desc': 'e: Employee's Name', 'type': 'string', 'example': 'John Smith', 'required': True}},
-    'f': {{'desc': 'f: Employee's Address', 'type': 'string', 'example': '123 Main St, City, State, ZIP', 'required': True}},
-    '14': {{'desc': '14: Other', 'type': 'string', 'example': 'DCP-REG 916.18  CA-SDI 66.53', 'required': False}},
-    '17': {{'desc': '17: Testing', "type": "string", 'example': '6,281.52', 'required': False}}
-}}
+            1. Confidence Filtering: Prioritize OCR results with confidence > 0.8
+            2. Spatial Relationships:
+              - Same row: y-coordinates within ±5 pixels
+              - Same column: x-coordinates within ±10 pixels
+              - Adjacent positioning: closest text element to field label
+            3. Alignment Detection: Find horizontally aligned label-value pairs
+            
+            Value Selection:
+              - Choose the highest confidence text element that's spatially related to the field
+              - Prefer values that are properly aligned (same row/column)
+              - Validate extracted values against expected type and format
+            """,
+            'w2_example': """
+            ==Positive Examples==
+            Example Fields dict:
+            {{
+                'a': {{'desc': 'a: Employee's Social Security Number (SSN) [9 digits]', 'type': 'string', 'example': '123456789', 'required': True}},
+                '1': {{'desc': '1 Wages tips other comp', 'type': 'float', 'example': 1234.56, 'required': True}},
+                'e': {{'desc': 'e: Employee's Name', 'type': 'string', 'example': 'John Smith', 'required': True}},
+                'f': {{'desc': 'f: Employee's Address', 'type': 'string', 'example': '123 Main St, City, State, ZIP', 'required': True}},
+                '12a': {{'desc': '12a: code', "type": "string", 'example': 'D 6,281.52', 'required': False}}
+                '14': {{'desc': '14: Other', 'type': 'string', 'example': 'DCP-REG 916.18  CA-SDI 66.53', 'required': False}},
+                            
+            }}
 
-Example Key-Value dict:
-{{
-    'a Employee's social security number'  : ['987654321 ', '987654321 ', '987654321 ', '987654321 ']
-    'e/f Employee's name, address and ZIP code'  : ['Yi Ding 6709 SETZLER PARKWAY BROOKLYN PARK MN 55445 ', 'Yi Ding 6709 SETZLER PARKWAY BROOKLYN PARK MN 55445 ', 'Yi Ding 6709 SETZLER PARKWAY BROOKLYN PARK MN 55445 ', 'Yi Ding 6709 SETZLER PARKWAY BROOKLYN PARK MN 55445 ']
-    '14 Other'  : ['', '', '', '']
-}}
+            Example Key-Value dict:
+            {{
+                'a Employee's social security number'  : ['987654321 ', '987654321 ', '987654321 ', '987654321 ']
+                '1 Wages tips other comp'  : ['52345.67 ', '52345.67 ', '52345.67 ', '52345.67 ']
+                'e Employee's name, address and ZIP code'  : ['Yi Ding 6709 SETZLER PARKWAY BROOKLYN PARK MN 55445 ', 'Yi Ding 6709 SETZLER PARKWAY BROOKLYN PARK MN 55445 ', 'Yi Ding 6709 SETZLER PARKWAY BROOKLYN PARK MN 55445 ', 'Yi Ding 6709 SETZLER PARKWAY BROOKLYN PARK MN 55445 '],
+                '12a code see inst, for box 12'  : ['D 6,281.52', 'D 6,281.52', 'D 6,281.52', 'D 6,281.52'],
+                '14 Other'  : ['DCP-REG 916.18  CA-SDI 66.53', 'DCP-REG 916.18', 'CA-SDI 66.53', 'DCP-REG 916.18  CA-SDI 66.53']
+            }}
 
-Example Return:
-'''
-{{
-    'a': '987654321',
-    'e': 'Yi Ding',
-    'f': '6709 SETZLER PARKWAY BROOKLYN PARK MN 55445'
-    '14': ''
-    '17': null
-}}
-'''""",
+            Example OCR text result:
+            '''
+            a Employee's SSN  987654321
+            1 Wages tips other comp  52345.67
+            e Employee's name, address and ZIP code  
+            Yi Ding 6709 SETZLER PARKWAY BROOKLYN PARK MN 55445
+            12a code see inst, for box 12  
+            D   6,281.52
+            14 Other  DCP-REG 916.18  
+            CA-SDI 66.53
+            '''
+
+            Example JSON output:
+            '''
+            {{
+                'a': '987654321',
+                'e': 'Yi Ding',
+                'f': '6709 SETZLER PARKWAY BROOKLYN PARK MN 55445',
+                '1': 52345.67,
+                '12a': 'D 6,281.52',
+                '14': 'DCP-REG 916.18  CA-SDI 66.53'
+            }}
+            '''
+            ===END OF POSITIVE EXAMPLES===
+            """,
+            'mismatch': """
+            === PREVIOUS EXTRACTION EXEMPLARIES ===
+            {mismatches}
+            ===END OF PREVIOUS EXTRACTION EXEMPLARIES===
+            """,
             'input': """
-==Input==
-Input Fields dict: 
-{fields}
+            === INPUT DATA ===
+            Input Fields dict: 
+            {fields}
 
-Input Data (key:value list dictionary, OCR result, and/or coordinate layout):
-{input_data}
-
-Return:
-'''
-{{output}}
-'''
-"""
+            Input OCR Data (key:value dict, OCR text, or OCR text with coordinates):
+            {input_data}
+            ===END OF INPUT DATA===
+            """
         }
 
     def generate_prompt(self, fields: dict, kvs: Dict = None, ocr: str = None, coordinates: List = None) -> tuple[str, int]:
         # Build prompt efficiently using string templates
+        prompt_parts = []
+
+        if self.meta_prompt:
+            tag = self.meta_prompt.tag
+            instructions = "\n".join(self.meta_prompt.instruction)
+            meta_section = self.base_template_parts['meta_prompt_instructions'].format(meta_instructions=f"<{tag}>\n{instructions}\n</{tag}>")
+            prompt_parts.append(meta_section)
+        
         if kvs:
             mode_instructions = self.base_template_parts['kvs']
         elif ocr:
@@ -136,19 +176,14 @@ Return:
         elif ocr and coordinates:
             mode_instructions = self.base_template_parts['spatial']
 
-        prompt_parts = [self.base_template_parts['base'].format(mode_instructions=mode_instructions)]
-
-        if self.iteration_error_analyses:
-            prompt_parts.append(self.base_template_parts['error_analysis_section'])
-
-        # Add example section
-        prompt_parts.append(self.base_template_parts['example'])
+        prompt_parts.append(self.base_template_parts['base'].format(mode_instructions=mode_instructions))
+        prompt_parts.append(self.base_template_parts['w2_example'])
 
         input_data = []
         if kvs:
             input_data.append(f"Input Key-Value dict:\n{kvs}")
         if ocr:
-            input_data.append(f"Input OCR result:\n{ocr}")
+            input_data.append(f"Input OCR text result:\n{ocr}")
         if coordinates:
             input_data.append(f"Input coordinates:\n{coordinates}")
         
@@ -163,8 +198,6 @@ Return:
         final_prompt = ''.join(prompt_parts)
 
         token_count = self.count_tokens(final_prompt)
-
-        # Join all parts efficiently
         return final_prompt, token_count
     
     def count_tokens(self, prompt: str) -> int:
@@ -178,7 +211,7 @@ Return:
         Returns:
         int: The number of tokens in the text
         """
-        model_encodings = {
+        openai_model_encodings = {
             "gpt-4o-mini": "o200k_base",
             "gpt-4o": "o200k_base", 
             "gpt-4": "cl100k_base",
@@ -188,306 +221,63 @@ Return:
             "gpt-4.1": "cl100k_base"  # Fallback encoding
         }
 
-        encoding_name = model_encodings.get(self.model_type, "cl100k_base")  # Default fallback
+        hf_model_tokenizers = {
+            "Qwen/Qwen3-8B": "Qwen/Qwen3-8B",
+            "mistralai/Mistral-7B-Instruct-v0.2": "mistralai/Mistral-7B-Instruct-v0.2"
+        }
         
+        # claude token count tbd
         try:
-            encoding = tiktoken.get_encoding(encoding_name)
-            return len(encoding.encode(prompt))
+            if self.model_type in openai_model_encodings:
+                encoding_name = openai_model_encodings[self.model_type]
+                encoding = tiktoken.get_encoding(encoding_name)
+                return len(encoding.encode(prompt))
+            elif self.model_type in hf_model_tokenizers:
+                tokenizer = AutoTokenizer.from_pretrained(hf_model_tokenizers[self.model_type])
+                return len(tokenizer.encode(prompt))
+            else:
+                print(f"Warning: Unknown model type {self.model_type}, using fallback estimate.")
+            return len(prompt) // 4
         except Exception as e:
             print(f"Warning: Could not count tokens for model {self.model_type}: {e}")
             return len(prompt) // 4
         
-
-    def _get_all_accumulated_mismatches(self) -> List[Dict]:
-        """Get all mismatches from all iterations flattened."""
-        all_mismatches = []
-        for iteration_mismatches in self.iteration_mismatches:
-            all_mismatches.extend(iteration_mismatches['mismatches'])
-        return all_mismatches
-    
-    def _find_new_mismatches(self, current_mismatches: Dict) -> Dict:
-        """Find mismatches that don't exist in previous iterations."""
-        previous_mismatches = self._get_all_accumulated_mismatches()
-        
-        new_file_mismatches = {}
-        
-        for filename, (mismatches, ocr_data) in current_mismatches.items():
-            new_mismatches = []
-            for mismatch in mismatches:
-                # Check if this mismatch is new
-                is_new = True
-                for prev_mismatch in previous_mismatches:
-                    if (mismatch.get('name') == prev_mismatch.get('name') and
-                        mismatch.get('column') == prev_mismatch.get('column') and
-                        str(mismatch.get('raw_value')) == str(prev_mismatch.get('raw_value')) and
-                        str(mismatch.get('true_value')) == str(prev_mismatch.get('true_value'))):
-                        is_new = False
-                        break
-                
-                if is_new:
-                    new_mismatches.append(mismatch)
-            
-            if new_mismatches:
-                new_file_mismatches[filename] = (new_mismatches, ocr_data)
-        
-        return new_file_mismatches
-    
-    def _update_error_counts(self, new_mismatches: Dict) -> None:
-        """Update document and field error counts for prioritization."""
-        for filename, (mismatches, _) in new_mismatches.items():
-            self.document_error_counts[filename] += len(mismatches)
-            for mismatch in mismatches:
-                field = mismatch.get('column')
-                if field:
-                    self.field_error_counts[field] += 1
-
-    def _prioritize_errors_for_template(self) -> List[Dict]:
-        """
-        Prioritize errors for inclusion in the template based on:
-        1. Fields with more errors (prioritized)
-        2. Documents with more errors (prioritized)
-        3. Recency (more recent iterations prioritized)
-        """
-        all_errors = []
-        
-        # Collect all errors with metadata
-        for iter_data in self.iteration_error_analyses:
-            iteration = iter_data['iteration']
-            analysis = iter_data['analysis']
-
-            for field, errors in analysis.items():
-                if field in self.fields:
-                    field_error_count = self.field_error_counts.get(field, 0)
-                    
-                    for error in errors:
-                        error_filename = error.get('filename')
-                        doc_error_count = self.document_error_counts.get(error_filename, 0) if error_filename else 0
-                        
-                        all_errors.append({
-                            'field': field,
-                            'error': error,
-                            'field_error_count': field_error_count,
-                            'doc_error_count': doc_error_count,
-                            'iteration': iteration,
-                        })
-        
-        # Sort by priority: field errors (desc), document errors (desc), recency (desc)
-        all_errors.sort(key=lambda x: (
-            -x['field_error_count'],  # More field errors = higher priority
-            -x['doc_error_count'],    # More document errors = higher priority
-            -x['iteration']           # More recent = higher priority
-        ))
-        
-        return all_errors
-    
-    def _select_exemplars_with_limits(self, prioritized_errors: List[Dict]) -> List[Dict]:
-        """
-        Select exemplars with limits on total count and per-field count.
-        """
-        selected_errors = []
-        field_counts = defaultdict(int)
-        
-        for error_data in prioritized_errors:
-            field = error_data['field']
-            
-            # Check if we've reached global limit
-            if len(selected_errors) >= 12:
-                break
-                
-            # Check if we've reached per-field limit
-            if field_counts[field] >= 3:
-                continue
-                
-            selected_errors.append(error_data)
-            field_counts[field] += 1
-        
-        return selected_errors
-    
-    def add_iteration_mismatches(self, new_mismatches: Dict) -> None:
-        """
-        Add mismatches from a new iteration and update error analysis incrementally.
-        
-        Args:
-            new_mismatches (List[Dict]): Mismatches from the current iteration
-        """
-        if not new_mismatches:
-            print("No mismatches to add for this iteration")
-            return
-        
-        # Find only the truly new mismatches (not seen in previous iterations)
-        unique_new_mismatches = self._find_new_mismatches(new_mismatches)
-        print(f"Found {len(unique_new_mismatches)} new mismatches")
-        
-        if not unique_new_mismatches:
-            print("No new unique mismatches found - all were seen in previous iterations")
-            return
-        
-        self._update_error_counts(unique_new_mismatches)
-        
-        # Add to iteration tracking
-        all_new_mismatches = []
-        ocr_context = {}
-        
-        for filename, (mismatches, ocr_data) in unique_new_mismatches.items():
-            all_new_mismatches.extend(mismatches)
-            ocr_context[filename] = ocr_data
-        
-        # Add to iteration tracking with OCR context
-        self.iteration_mismatches.append({
-            'mismatches': all_new_mismatches,
-            'ocr_context': ocr_context,
-            'file_mismatches': unique_new_mismatches
-        })
-        self.current_iteration += 1
-        
-        print(f"Iteration {self.current_iteration}: Added {len(unique_new_mismatches)} new mismatches")
-        print(f"Total mismatches across all iterations: {len(self._get_all_accumulated_mismatches())}")
-        
-        # Generate error analysis for ONLY the new mismatches
-
-        new_error_analysis = {}
-        with ThreadPoolExecutor(max_workers=5) as executor:  # Limit concurrent API calls
-            # Submit all tasks
-            future_to_file = {
-                executor.submit(self.get_error_analysis, mismatches, ocr_data, filename): filename
-                for filename, (mismatches, ocr_data) in unique_new_mismatches.items()
-            }
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_file):
-                filename = future_to_file[future]
-                try:
-                    response = future.result(timeout=30)  # 30 second timeout per call
-                    if response and 'response' in response:
-                        for field, errors in response['response'].items():
-                            new_error_analysis[field] = new_error_analysis.get(field, []) + errors
-                except Exception as e:
-                    print(f"Error analyzing {filename}: {e}")
-
-        # Store the error analysis for this iteration
-        self.iteration_error_analyses.append({
-            'iteration': self.current_iteration,
-            'analysis': new_error_analysis,
-            'mismatch_count': len(unique_new_mismatches)
-        })
-
-        self._rebuild_error_analysis_section()  # Update the error analysis section
-
-    def _rebuild_error_analysis_section(self) -> None:
-        """Rebuild the complete error analysis section from all iterations."""
-        if not self.iteration_error_analyses:
-            self.base_template_parts['error_analysis_section'] = ""
-            return
-        
-        prioritized_errors = self._prioritize_errors_for_template()
-        selected_errors = self._select_exemplars_with_limits(prioritized_errors)
-
-
-
-        error_sections = []
-        
-        # Add main header
-        error_sections.append(self.base_template_parts['error_header'])
-        
-        # Process each iteration's error analysis
-        for error_data in selected_errors:
-            field = error_data['field']
-            error = error_data['error']
-            
-            error_sections.append(
-                self.base_template_parts['field_error'].format(
-                    field=field,
-                    desc=self.fields[field]['desc'],
-                    pred=error['actual'],
-                    reason=error['reason'],
-                    true=error['expected']
-                )
-            )
-                        
-        # Update the error analysis section
-        self.base_template_parts['error_analysis_section'] = ''.join(error_sections)
-        
-        total_iterations = len(self.iteration_error_analyses)
-        total_mismatches = len(self._get_all_accumulated_mismatches())
-        print(f"Rebuilt error analysis section with {total_iterations} iterations, {total_mismatches} total mismatches")
-
-    def get_error_analysis(self, mismatches: list, ocr_data: str, filename: str) -> dict:
-        llm = ChatOpenAI(model=self.model_type, temperature=0)
-        llm = llm.with_structured_output(ErrorAnalysis)
-
-        prompt = """
-    You are an expert in document field extraction error analysis. 
-    Your job is to take a list of mismatches between 'expected' vs. 'predicted' values, 
-    With given field information and OCR context, lets think step-by-step
-
-    1. Root Cause Analysis: Identify why the extraction model failed
-    2. Self-Reflection: Generate insights about what the model might have "thought" during extraction
-    3. Evidence Mapping: Connect OCR artifacts to extraction decisions
-    4. Pattern Recognition: Identify systematic vs. isolated errors
-
-    RESPONSE FORMAT:
-    Return a dictionary where:
-    - The 'response' key contains a dictionary
-    - Each field name maps to a LIST of error objects
-    - Each error object has:
-    - expected: ground truth value
-    - actual: model predicted value
-    - reason: a concise reasoning or explanation of why the model failed after self-reflection
-    - filename: the filename of the document (use: {filename})
-
-    INPUT DATA:
-    Fields:
-    {fields}
-
-    filename:
-    {filename}
-
-    OCR Context:
-    {ocr_context}
-
-    Mismatches:
-    {mismatches} 
-        """
-
-        response = llm.invoke(prompt.format(fields=self.fields, ocr_context=ocr_data, mismatches=mismatches, filename=filename))
-        return response
-        
-    def structured_model(self, fields: dict) -> Type:
-        output_format = create_model(
+    def structured_model(self, fields: dict, include_rationale: bool) -> Type:
+        fields_model = create_model(
             "DynamicFieldOutputs",
-            **{key: Optional[TypeMapping.string_to_type(field["type"])] for key, field in fields.items()}
-
+            **{key: Optional[TypeMapping.string_to_type(field["type"])] 
+            for key, field in fields.items()}
         )
-        return output_format
+
+        output_model = create_model(
+            "ExtractorOutput",
+            result=(fields_model, ...)
+        )
+
+        if include_rationale:
+            output_model = create_model(
+                "ExtractorOutput",
+                result=(fields_model, ...),
+                logic=(str, ...)
+            )
+            return output_model
+        
+        return output_model
 
     def output_filling(self, model_cls: dict, response: BaseModel) -> tuple[Type, List[str]]:
         missing = set()
         filled_model = response.model_dump()
 
         for name in model_cls:
-            if model_cls[name]:
-                continue
-            elif filled_model[name] is None or filled_model[name] == "":
-                missing.add(name)
-            else:
+            if name in filled_model:
                 model_cls[name] = filled_model[name]
-        
+            
+            if not validate(self.fields[name]['type'], model_cls[name], self.fields[name]['required']):
+                missing.add(name)
+
         return model_cls, missing
 
-    def get_response(self, fields: dict, kvs: dict = None, ocr: str = None, coordinates: list = None):
-        llm = ChatOpenAI(model=self.model_type, temperature=0)
-        output_format = self.structured_model(fields)
-
-        llm = llm.with_structured_output(output_format)
-        prompt, token_count = self.generate_prompt(fields=fields, kvs=kvs, ocr=ocr, coordinates=coordinates)
-        
-        print(f"Prompt token count: {token_count}")
-        
-        response = llm.invoke(prompt)
-
-        return response
-
-    def fv_extract(self, kvs: dict[str, list[str]] = None, ocr: str = None, coordinates: list = None) -> dict[str, str]:
+    def fv_extract(self, kvs: dict[str, list[str]] = None, ocr: str = None, coordinates: list = None, include_rationale: bool = False) -> dict:
         '''
         Extract values from a key-value dictionary based on field descriptions and types.
         
@@ -501,7 +291,7 @@ Return:
         
         # Track the number of attempts and Initialize results and incomplete fields
         attempts = 0
-        results = {k: None for k in self.fields.keys()}
+        results, rationale = {k: None for k in self.fields.keys()}, None
         incomplete_fields = {k: self.fields[k] for k in self.fields.keys()}
         
         # Iterate until all fields are filled or max attempts reached
@@ -509,15 +299,16 @@ Return:
             try:
                 print('Attempt #', attempts + 1)
                 
-                # Query the OpenAI API with the prompt
-                response = self.get_response(fields=incomplete_fields, kvs=kvs, ocr=ocr, coordinates=coordinates)
-                results, missing = self.output_filling(results, response)
+                output_format = self.structured_model(incomplete_fields, include_rationale=include_rationale)
+                prompt, token_count = self.generate_prompt(fields=incomplete_fields, kvs=kvs, ocr=ocr, coordinates=coordinates)
+                response = self.llm.get_response(prompt, output_format=output_format)
+                results, missing = self.output_filling(results, response.result if include_rationale else response)
 
-                # Check for incomplete fields
-                incomplete_fields = {
-                    k: incomplete_fields[k]
-                    for k in missing
-                }
+                if include_rationale and hasattr(response, 'logic'):
+                    rationale = response.logic
+
+                incomplete_fields = {k: incomplete_fields[k] for k in missing}
+
                 
                 # If all fields are filled, break the loop
                 if len(incomplete_fields) == 0:
@@ -529,4 +320,7 @@ Return:
                 # If JSON decoding fails, return the raw result
                 print(f"Failed to decode JSON: {response}")
             
-        return results
+        return {
+            'result': results,
+            'rationale': rationale
+        }
