@@ -1,14 +1,13 @@
 from abc import ABC, abstractmethod
 import base64
-import io
 import logging
 import os
 import sys
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 from pathlib import Path
 import boto3
-from pdf2image import convert_from_path
+import pymupdf
 from mistralai import Mistral
 
 
@@ -44,14 +43,12 @@ class TextractOCR(OCRMethod):
 
         # currently pdf needs to be converted to image -> is this the best way to do this?
         if ext == 'pdf':
-            images = convert_from_path(file_path)
+            images = pymupdf.open(file_path)
 
             results = []
             for page_num, image in enumerate(images):
                 print(f"Processing page {page_num + 1}")
-                img_byte_arr = io.BytesIO()
-                image.save(img_byte_arr, format='PNG')
-                file_bytes = img_byte_arr.getvalue()
+                file_bytes = image.get_pixmap().tobytes()
 
                 response = client.detect_document_text(Document={'Bytes': file_bytes})
 

@@ -168,54 +168,62 @@ class LangChainModel(BaseModel):
             )
         
         try:
-            if model_name == "gpt-4":
+            if model_name == ["gpt-4o-mini", "gpt-4.1", "gpt-o3"]:
                 api_key = os.getenv('OPENAI_API_KEY')
                 if not api_key:
                     raise ValueError("OPENAI_API_KEY not found in environment variables")
-                logger.info(f"Initializing OpenAI GPT-4 model...")
+                logger.info("Initializing OpenAI GPT-4 model...")
                 self.model = ChatOpenAI(
-                    model="gpt-4-turbo-preview",
+                    model=model_name,
                     temperature=0,
                     max_tokens=150,
                     openai_api_key=api_key
                 )
-                logger.info(f"GPT-4 model initialized successfully")
+                logger.info("GPT-4 model initialized successfully")
             elif model_name == "gemini":
                 api_key = os.getenv('GOOGLE_API_KEY')
                 if not api_key:
                     raise ValueError("GOOGLE_API_KEY not found in environment variables")
-                logger.info(f"Initializing Google Gemini model...")
+                logger.info("Initializing Google Gemini model...")
                 self.model = ChatGoogleGenerativeAI(
                     model="gemini-pro",
                     temperature=0,
                     max_output_tokens=150, 
                     google_api_key=api_key
                 )
-                logger.info(f"Gemini model initialized successfully")
+                logger.info("Gemini model initialized successfully")
             elif model_name == "claude":
                 api_key = os.getenv('ANTHROPIC_API_KEY')
                 if not api_key:
                     raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
-                logger.info(f"Initializing Anthropic Claude model...")
+                logger.info("Initializing Anthropic Claude model...")
                 self.model = ChatAnthropic(
                     model="claude-3-opus-20240229",
                     temperature=0,
                     max_tokens=150,
                     anthropic_api_key=api_key
                 )
-                logger.info(f"Claude model initialized successfully")
+                logger.info("Claude model initialized successfully")
             else:
                 raise ValueError(f"Unsupported LangChain model: {model_name}")
         except Exception as e:
             logger.error(f"Error initializing {model_name} model: {e}")
             raise
 
-    def get_response(self, prompt: str, max_new_tokens: int = 100) -> str:
+    def get_response(self, prompt: str, max_new_tokens: int = 100, **kwargs) -> str:
         """Get response from the LangChain model."""
         try:
+            model = self.model
+            output_format = kwargs.pop('output_format', None)
+            if output_format:
+                model = model.with_structured_output(output_format)
             # Simple invoke - max_tokens is already set in constructor
-            response = self.model.invoke(prompt)
-            return response.content.strip()
+            response = model.invoke(prompt)
+            
+            if hasattr(response, "content"):
+                return response.content.strip()
+            else:
+                return response
         except Exception as e:
             logger.error(f"Error in {self.model_name} query: {str(e)}")
             logger.error(f"Full error details: {e}")
@@ -237,7 +245,7 @@ def get_model(model_name: str) -> BaseModel:
     """
     if model_name in ["Qwen/Qwen3-8B", "mistralai/Mistral-7B-Instruct-v0.2"]:
         return OpenSourceModel(model_name)
-    elif model_name in ["gpt-4", "gemini", "claude"]:
+    elif model_name in ["gpt-4o-mini", "gpt-4.1", "gpt-o3", "gemini", "claude"]:
         return LangChainModel(model_name)
     else:
         raise ValueError(

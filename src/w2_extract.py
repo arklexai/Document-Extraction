@@ -5,6 +5,7 @@ import json
 import pickle
 import threading
 import time
+from typing import List
 import pandas as pd
 
 import zipfile
@@ -15,10 +16,12 @@ import argparse
 
 import yaml
 
+from example import Example
 from kv_extract import KVExtractDocument
-from fv_extract import OptimizedExtraction
+from fv_extract import FVExtraction
 import ocr_load
 from evaluation import compare_datasets
+from optimizer import PromptOptimizer
 
 w2_fields = {
     'a': {"desc": "a Employee's Social Security Number (SSN)", "type": "string", 'example': '123456789', 'required': True},
@@ -149,15 +152,6 @@ def clear_batch_results(batch_id):
             pickle.dump(batch_data, f)
         print(f"Cleared field extraction results, kept OCR cache: {batch_file}")
 
-def group_mismatches_by_file(mismatches):
-    """Group mismatches by filename."""
-    from collections import defaultdict
-    grouped = defaultdict(list)
-    for mismatch in mismatches:
-        filename = mismatch['name']
-        grouped[filename].append(mismatch)
-    return dict(grouped)
-
 def get_cached_file_data(filename, batch_id, ocr_method):
     """Get cached OCR data for a specific file."""
     _, _, ocr_cache = load_batch_results(batch_id)
@@ -189,8 +183,78 @@ def load_fields(file) -> dict[str, dict]:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
+def create_trainset(ocr_cache, labels_df, fields, ocr_mode: str="ocr") -> List[Example]:
+    dataset = []
+    
+    for idx, row in labels_df.iterrows():
+        filename = row['file']
+        
+        # Check if we have OCR data for this file
+        if filename not in ocr_cache:
+            print(f"Warning: No OCR data found for {filename}")
+            continue
 
-def extract_file(filepath: str, fields: dict[str, dict]=w2_fields, max_attempts: int=3, batch_id: str=None, filename: str=None, model_type: str="gpt-4o-mini", ocr_method: str="textract-kv", spatial: bool=False, extractor: OptimizedExtraction=None, save_batch: bool=True) -> list[dict[str, str]]:
+        ocr_pages = ocr_cache[filename]
+        
+        
+        # Create expected output dictionary
+        expected_fields = {}
+        for field in fields.keys():
+            value = row[field]
+            expected_fields[field] = value
+        
+        example = Example(
+            fields=str(fields),
+            context=str(ocr_pages),
+            mode=ocr_mode,
+            output=expected_fields
+        )
+        
+        dataset.append(example)
+        print(f"Added training example for {filename}")
+    
+    return dataset
+
+def get_ocr_data(args):
+    filepath, filename, batch_id, ocr_method = args
+
+    print(f"Processing {filepath}")
+
+    file_cache_key =  get_file_cache_key(filepath, ocr_method)
+
+    # Load existing batch results
+    _, _, ocr_cache = load_batch_results(batch_id)
+
+    if file_cache_key in ocr_cache:
+        print(f"Using cached OCR results for {filename}")
+        pages = ocr_cache[file_cache_key]
+    else:
+        print(f"Running OCR for {filename}")
+        # Run OCR
+        if ocr_method == "mistral":
+            ocr_method_obj = ocr_load.MistralOCR()
+            ocr = ocr_load.OCR(filepath, ocr_method_obj)
+            ocr_results = ocr.get_plain_text()
+            pages = ocr_results
+        elif ocr_method == "textractocr":
+            ocr_method_obj = ocr_load.TextractOCR()
+            ocr = ocr_load.OCR(filepath, ocr_method_obj)
+            ocr_results = ocr.get_plain_text()
+            pages = ocr_results
+        elif ocr_method == "textract-kv":
+            kv_extractor = KVExtractDocument(filepath)
+            pages = kv_extractor.pages
+        else:
+            raise ValueError(f"Unsupported OCR method: {ocr_method}")
+        
+        # Cache OCR results
+        ocr_cache[file_cache_key] = pages
+        save_batch_results(batch_id, _, _, ocr_cache)
+    
+    return filename, pages
+        
+
+def extract_file(filepath: str, fields: dict[str, dict]=w2_fields, max_attempts: int=3, batch_id: str=None, filename: str=None, model_type: str="gpt-4o-mini", ocr_method: str="textract-kv", spatial: bool=False, extractor: FVExtraction=None) -> list[dict[str, str]]:
     '''
     Extracts W2 fields from a PDF file using Textract.
     
@@ -223,20 +287,14 @@ def extract_file(filepath: str, fields: dict[str, dict]=w2_fields, max_attempts:
             ocr = ocr_load.OCR(filepath, ocr_method_obj)
             ocr_results = ocr.get_text_blocks()
             pages = ocr_results
-            print("========mistral OCR results==========")
-            print(json.dumps(pages[0], indent=4))
         elif ocr_method == "textractocr":
             ocr_method_obj = ocr_load.TextractOCR()
             ocr = ocr_load.OCR(filepath, ocr_method_obj)
             ocr_results = ocr.get_text_blocks()
             pages = ocr_results
-            print("========textractocr OCR results==========")
-            print(json.dumps(pages[0]['value'], indent=4))
         elif ocr_method == "textract-kv":
             kv_extractor = KVExtractDocument(filepath)
             pages = kv_extractor.pages
-            print("========textract-kv Image-to-text results==========")
-            print(pages[0].kvs)
         else:
             raise ValueError(f"Unsupported OCR method: {ocr_method}")
         
@@ -249,7 +307,7 @@ def extract_file(filepath: str, fields: dict[str, dict]=w2_fields, max_attempts:
         return results
     
     if extractor is None:
-        extractor = OptimizedExtraction(fields=fields, model_type=model_type, max_attempts=max_attempts)
+        extractor = FVExtraction(fields=fields, model_type=model_type, max_attempts=max_attempts)
     
     # Process each page
     # kv_document.pages or ocr_results
@@ -271,8 +329,7 @@ def extract_file(filepath: str, fields: dict[str, dict]=w2_fields, max_attempts:
             
             processed_files[filename] = processed_pages
             file_results[filename] = results
-            if save_batch:
-                save_batch_results(batch_id, processed_files, file_results, ocr_cache)
+            save_batch_results(batch_id, processed_files, file_results, ocr_cache)
                 
             print(f"Processed page {page_num + 1} of {filename}")
             
@@ -310,7 +367,9 @@ def process_single_file_parallel(args):
         print(f"Error processing {filename} after {processing_time:.2f} seconds: {str(e)}")
         return filename, None, e
 
-def extract_dir(dirpath: str, fields=w2_fields, file_out=None, batch_id: str=None, model_type: str="gpt-4.1", ocr_method: str="textract-kv", spatial: bool=False, prompt_opt: bool=False, label_file: str=None, test_file: str=None, test_label: str=None, max_workers: int=4) -> pd.DataFrame:
+
+def extract_dir(dirpath: str, fields=w2_fields, file_out=None, batch_id: str=None, model_type: str="gpt-4o-mini", ocr_method: str="mistral", spatial: bool=False, prompt_opt: bool=False, label_file: str=None, training_file: str=None, training_label: str=None, max_workers: int=4) -> pd.DataFrame:
+
     '''
     Extracts W2 fields from all PDF/JPG/PNG files in a directory.
     
@@ -324,13 +383,61 @@ def extract_dir(dirpath: str, fields=w2_fields, file_out=None, batch_id: str=Non
     '''
     if batch_id is None:
         batch_id = get_batch_id_dir(dirpath)
-    
+
+        
     # List all PDF/JPG/PNG files in the directory
     files = [f for f in os.listdir(dirpath) if f.endswith('.pdf') or f.endswith('.png') or f.endswith('.jpg')]
     paths = [os.path.join(dirpath, f) for f in files]
     
-    processed_files, file_results, ocr_cache = load_batch_results(batch_id)
+    base_extractor = FVExtraction(fields=fields, model_type=model_type)
+    extractor_to_use = base_extractor 
+
     
+    if prompt_opt and training_file and training_label:
+        training_files = [f for f in os.listdir(training_file) if f.endswith('.pdf') or f.endswith('.png') or f.endswith('.jpg')]
+        training_paths = [os.path.join(training_file, f) for f in training_files]
+
+        process_args = [
+            (filepath, filename, batch_id, ocr_method)
+            for filepath, filename in zip(training_paths, training_files)
+        ]
+
+        results = {}
+        failed_files = []
+
+        if process_args:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks
+                future_to_file = {
+                    executor.submit(get_ocr_data, args): args[1] 
+                    for args in process_args
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_file):
+                    filename = future_to_file[future]
+                    try:
+                        filename, result = future.result()
+                        results[filename] = result
+                    except Exception as e:
+                        failed_files.append((filename, e))
+                        print(f"✗ Exception processing {filename}: {e}")
+        
+        if failed_files:
+            print(f"\nFailed to process {len(failed_files)} files:")
+            for filename, error in failed_files:
+                print(f"  - {filename}: {error}")
+
+        labels_df = pd.read_csv(training_label, keep_default_na=False, na_filter=False)
+        dataset = create_trainset(ocr_cache=results, labels_df=labels_df, fields=fields, ocr_mode="ocr" if ocr_method != "textract-kv" else "kv")
+
+        optimizer = PromptOptimizer(fields=fields, model_type=model_type)
+        optimized_extractor = optimizer.optimize_prompt(extractor=base_extractor, train_data=dataset)
+        extractor_to_use = optimized_extractor
+        
+    
+    processed_files, file_results, ocr_cache = load_batch_results(batch_id)
+
     pending_files = []
     pending_paths = []
     completed_results = {}
@@ -346,13 +453,12 @@ def extract_dir(dirpath: str, fields=w2_fields, file_out=None, batch_id: str=Non
         pending_files.append(filename)
         pending_paths.append(filepath)
 
-    print(f"Processing {len(pending_files)} files ({len(files) - len(pending_files)} already completed)")
 
-    base_extractor = OptimizedExtraction(fields=fields, model_type=model_type) if prompt_opt else None
+    print(f"Processing {len(pending_files)} files ({len(files) - len(pending_files)} already completed)")
     
     # Prepare arguments for parallel processing
     process_args = [
-        (filepath, filename, fields, batch_id, model_type, ocr_method, spatial, base_extractor)
+        (filepath, filename, fields, batch_id, model_type, ocr_method, spatial, extractor_to_use)
         for filepath, filename in zip(pending_paths, pending_files)
     ]
 
@@ -402,139 +508,39 @@ def extract_dir(dirpath: str, fields=w2_fields, file_out=None, batch_id: str=Non
                 temp.update(page)
                 entries.append(temp)
 
-    # Optionally convert to DataFrame and save as CSV
-    # df = pd.DataFrame.from_dict(entries, orient='index')
     df = pd.DataFrame(entries)
     print(df)
 
-    if prompt_opt and label_file:
-        print("Running prompt optimization with evaluation...")
-
-        test_files = [f for f in os.listdir(test_file) if f.endswith('.pdf') or f.endswith('.png') or f.endswith('.jpg')]
-        test_paths = [os.path.join(test_file, f) for f in test_files]
+    
+    # Save to CSV or Excel if specified
+    if file_out is not None:
+        # CSV
+        if file_out.endswith('.csv'):
+            df.to_csv(file_out) 
         
-        # Create temporary directory for intermediate results
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Save initial results
-            temp_preds_file = os.path.join(temp_dir, "temp_preds.csv")
-            df.to_csv(temp_preds_file, index=False)
-            
-            # First evaluation
-            total_comparisons, correct_comparisons, mismatches = compare_datasets(
-                labels_files=[label_file],
-                preds_file=temp_preds_file
-            )
-            print(f"Initial accuracy: {correct_comparisons/total_comparisons:.2%}")
-            print(f"Initial mismatches: {len(mismatches)}")
-            grouped_mismatches = group_mismatches_by_file(mismatches)
+        # Excel
+        elif file_out.endswith('.xlsx'):
+            # Use xlsxwriter to save DataFrame to Excel
+            with pd.ExcelWriter(file_out, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False, sheet_name='Sheet1')
+                worksheet = writer.sheets['Sheet1']
 
-            file_mismatches = {}
-            for filename, mismatches in grouped_mismatches.items():
-                cached_data = get_cached_file_data(filename, batch_id, ocr_method)
-                file_mismatches[filename] = (mismatches, cached_data)
-                
-            base_extractor.add_iteration_mismatches(file_mismatches)
-            
-            # Second run with mismatches
-            print("Running second extraction with mismatches...")
-            clear_batch_results(batch_id)
-            
-            process_args = [
-                (filepath, filename, fields, batch_id, model_type, ocr_method, spatial, base_extractor)
-                for filepath, filename in zip(test_paths, test_files)
-            ]
-            
-            results = {}
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_file = {
-                    executor.submit(process_single_file_parallel, args): args[1] 
-                    for args in process_args
-                }
-                
-                for future in as_completed(future_to_file):
-                    filename = future_to_file[future]
-                    try:
-                        filename, result, error = future.result()
-                        if error is None and result is not None:
-                            results[filename] = result
-                    except Exception as e:
-                        print(f"Error in second run for {filename}: {e}")
-            
-            # Combine second run results
-            entries = []
-            for filename in files:
-                if filename in results:
-                    for pnum, page in enumerate(results[filename]):
-                        temp = {'file': filename, 'page': pnum + 1}
-                        temp.update(page)
-                        entries.append(temp)
-            
-            df = pd.DataFrame(entries)
-            df.to_csv(temp_preds_file, index=False)
-            
-            # Second evaluation
-            total_comparisons, correct_comparisons, new_mismatches = compare_datasets(
-                labels_files=[label_file],
-                preds_file=temp_preds_file
-            )
-            print(f"Second run accuracy: {correct_comparisons/total_comparisons:.2%}")
-            print(f"Second run mismatches: {len(new_mismatches)}")
-            print(new_mismatches)
+                # Adjust column widths
+                for col_idx, col in enumerate(df.columns, start=1):
+                    max_length = max(df[col].astype(str).map(len).max(), len(col)) + 2  # Add padding
+                    worksheet.set_column(col_idx - 1, col_idx - 1, max_length)
 
-            new_grouped_mismatches = group_mismatches_by_file(new_mismatches)
-
-            new_file_mismatches = {}
-            for filename, mismatches in new_grouped_mismatches.items():
-                cached_data = get_cached_file_data(filename, batch_id, ocr_method)
-                new_file_mismatches[filename] = (mismatches, cached_data)
-
-            base_extractor.add_iteration_mismatches(new_file_mismatches)
-            
-            # Final run with updated mismatches
-            print("Running final extraction with updated mismatches...")
-            clear_batch_results(batch_id)
-            
-            process_args = [
-                (filepath, filename, fields, batch_id, model_type, ocr_method, spatial, base_extractor)
-                for filepath, filename in zip(test_paths, test_files)
-            ]
-            
-            results = {}
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_file = {
-                    executor.submit(process_single_file_parallel, args): args[1] 
-                    for args in process_args
-                }
-                
-                for future in as_completed(future_to_file):
-                    filename = future_to_file[future]
-                    try:
-                        filename, result, error = future.result()
-                        if error is None and result is not None:
-                            results[filename] = result
-                    except Exception as e:
-                        print(f"Error in final run for {filename}: {e}")
-            
-            # Combine final run results
-            entries = []
-            for filename in test_files:
-                if filename in results:
-                    for pnum, page in enumerate(results[filename]):
-                        temp = {'file': filename, 'page': pnum + 1}
-                        temp.update(page)
-                        entries.append(temp)
-            
-            df = pd.DataFrame(entries)
-            df.to_csv(temp_preds_file, index=False)
-            
-            # Final evaluation
-            total_comparisons, correct_comparisons, mismatches = compare_datasets(
-                labels_files=[test_label],
-                preds_file=temp_preds_file
-            )
-            print(f"Final accuracy: {correct_comparisons/total_comparisons:.2%}")
+    if label_file:
+        total_comparisons, correct_comparisons, final_mismatches = compare_datasets(
+            labels_files=[label_file],
+            preds_file=file_out
+        )
+        print(f"Final test accuracy: {correct_comparisons/total_comparisons:.2%}")
+        print(f"Final test mismatches: {len(final_mismatches)}")
+    
     
     return df
+  
 
 def extract_zip(file, fields=w2_fields, file_out=None) -> pd.DataFrame:
     '''
@@ -587,14 +593,14 @@ if __name__ == "__main__":
     parser.add_argument("--type", default=None, choices=['file', 'dir', 'zip'], type=str, help="Type of extraction: 'file' for single file, 'dir' for directory, 'zip' for zip file.")
     parser.add_argument("--file_out", default=None, type=str, help="Path to save the output CSV or Excel file. None to skip saving.")
     parser.add_argument("--max_attempts", default=3, type=int, help="Maximum number of attempts to extract fields.")
-    parser.add_argument("--model_type_or_path", default="gpt-4o-mini", choices=["gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-o3"], help="Model type used for fv extraction")
+    parser.add_argument("--model_type_or_path", default="gpt-4o-mini", choices=["gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-o3", "Qwen/Qwen2.5-7B-Instruct-Turbo", "Qwen/Qwen3-8B", "mistralai/Mistral-7B-Instruct-v0.2"], help="Model type used for fv extraction")
     parser.add_argument("--ocr_method", default="textract-kv", choices=["mistral", "textractocr", "textract-kv"], help="OCR method to use")
     parser.add_argument("--spatial_ocr", action="store_true", help="Enable spatial OCR with coordinate information")
     parser.add_argument("--prompt_opt", action="store_true", help="Enable prompt optimization with evaluation")
     parser.add_argument("--label_file", type=str, help="Path to the label file for evaluation when prompt_opt is True")
-    parser.add_argument("--test_file", type=str, help="Path to the test file path for evaluation when prompt_opt is True")
-    parser.add_argument("--test_label", type=str, help="Path to the test label file for evaluation when prompt_opt is True")
-    parser.add_argument("--save_batch", action="store_true", help="Save batch results")
+    parser.add_argument("--train_file", type=str, help="Path to the training file path for prompt optimization when prompt_opt is True")
+    parser.add_argument("--train_label", type=str, help="Path to the training label file for prompt optimization when prompt_opt is True")
+
     args = parser.parse_args()
 
     try:
@@ -621,18 +627,20 @@ if __name__ == "__main__":
         if args.type == 'file':
             # If a single PDF file is provided, extract from that file
             filename = os.path.basename(args.filepath)
-            result_df = extract_file(args.filepath, custom_fields, args.max_attempts, batch_id=0, filename=filename, model_type=args.model_type_or_path, ocr_method=args.ocr_method, spatial=args.spatial_ocr, save_batch=args.save_batch)
+            result_df = extract_file(args.filepath, custom_fields, args.max_attempts, batch_id=0, filename=filename, model_type=args.model_type_or_path, ocr_method=args.ocr_method, spatial=args.spatial_ocr)
         elif args.type == 'dir':
             # If a directory is provided, extract from all PDF files in that directory
-            result_df = extract_dir(args.filepath, custom_fields, args.file_out, model_type=args.model_type_or_path, ocr_method=args.ocr_method, spatial=args.spatial_ocr, prompt_opt=args.prompt_opt, label_file=args.label_file, test_file=args.test_file, test_label=args.test_label)
+            result_df = extract_dir(args.filepath, custom_fields, args.file_out, model_type=args.model_type_or_path, ocr_method=args.ocr_method, spatial=args.spatial_ocr, prompt_opt=args.prompt_opt, label_file=args.label_file, training_file=args.train_file, training_label=args.train_label)
         elif args.type == 'zip':
             # If a ZIP file is provided, extract from all PDF files in that ZIP file
             with open(args.filepath, 'rb') as f:
                 zip_file = BytesIO(f.read())
                 zip_file.name = os.path.basename(args.filepath)
                 result_df = extract_zip(zip_file, custom_fields, args.file_out)
+                
         print("Processing completed successfully!")
         print(result_df)
+
         # Save to CSV or Excel if specified
         if args.file_out is not None:
             # CSV
